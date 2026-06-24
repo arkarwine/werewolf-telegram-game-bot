@@ -4,7 +4,7 @@ import os
 import random
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import Forbidden
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -12,6 +12,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+from telegram.helpers import escape_markdown
 
 # Enable logging
 logging.basicConfig(
@@ -136,6 +137,46 @@ def format_duration(seconds):
     if seconds % 60 == 0:
         return f"{seconds // 60} မိနစ်"
     return f"{seconds} စက္ကန့်"
+
+
+def escape_md(text):
+    return escape_markdown(str(text), version=1)
+
+
+def player_display_name(user):
+    return user.first_name or user.full_name or user.username or "Player"
+
+
+async def update_lobby_message(context, chat_id, game, *, query=None, message=None):
+    text = build_lobby_text(game)
+    markup = build_lobby_keyboard(chat_id, game)
+
+    async def send_with_mode(parse_mode):
+        kwargs = {"reply_markup": markup}
+        if parse_mode:
+            kwargs["parse_mode"] = parse_mode
+        if query is not None:
+            await query.edit_message_text(text, **kwargs)
+            return None
+        if message is not None:
+            return await message.reply_text(text, **kwargs)
+        return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+
+    try:
+        return await send_with_mode("Markdown")
+    except BadRequest as error:
+        if "message is not modified" in str(error).lower():
+            return None
+        logger.warning(
+            "Markdown lobby update failed for chat %s, retrying without parse_mode",
+            chat_id,
+        )
+        try:
+            return await send_with_mode(None)
+        except BadRequest as retry_error:
+            if "message is not modified" in str(retry_error).lower():
+                return None
+            raise
 
 
 def parse_voting_duration(args):
@@ -285,7 +326,7 @@ def build_lobby_keyboard(chat_id, game):
 
 
 def build_lobby_text(game):
-    players = "\n".join([f"- {p['name']}" for p in game.players.values()])
+    players = "\n".join([f"- {escape_md(p['name'])}" for p in game.players.values()])
     if not players:
         players = "- မရှိသေးပါ"
 
@@ -299,7 +340,8 @@ def build_lobby_text(game):
         f"Seer: {game.seer_count} ယောက် ({seer_mode})\n"
         f"မဲပေးချိန်: {format_duration(game.voting_seconds)}\n\n"
         f"{players}\n\n"
-        "ကစားသမားအရေအတွက်ပေါ်မူတည်ပြီး role အရေအတွက်ကို အလိုအလျောက်အကြံပြုပေးထားပါတယ်။ `+` / `-` နဲ့ လိုသလိုပြောင်းနိုင်ပါတယ်။\n\n"
+        "ကစားသမားအရေအတွက်ပေါ်မူတည်ပြီး role အရေအတွက်ကို အလိုအလျောက်အကြံပြုပေးထားပါတယ်။ + / - နဲ့ လိုသလိုပြောင်းနိုင်ပါတယ်။\n\n"
+        "💡 Bot ကို private chat မှာ `/start` လုပ်ထားမှ role message ရပြီး game ထဲဝင်နိုင်ပါတယ်။\n"
         "အနည်းဆုံး ၄ ယောက် ရှိမှ `/startgame` နဲ့ စလို့ရပါမယ်။"
     )
 
@@ -382,6 +424,8 @@ def schedule_game_phase(chat_id, coro):
 
 async def send_private_message(context, user_id, text, **kwargs):
     try:
+        if "parse_mode" not in kwargs:
+            kwargs["parse_mode"] = "Markdown"
         await context.bot.send_message(chat_id=user_id, text=text, **kwargs)
         return True
     except Forbidden:
@@ -406,7 +450,7 @@ async def is_bot_admin(context, chat_id):
     return member.status in ("administrator", "creator")
 
 
-async def ensure_game_chat(update, context):
+async def ensure_game_chat(update, context, require_admin=True):
     chat = update.effective_chat
     if not chat or chat.type == "private":
         if update.message:
@@ -421,7 +465,7 @@ async def ensure_game_chat(update, context):
         return False
 
     save_chat(chat.id)
-    if not await is_bot_admin(context, chat.id):
+    if require_admin and not await is_bot_admin(context, chat.id):
         if update.message:
             await update.message.reply_text(
                 "⚠️ Game command တွေသုံးဖို့ Bot ကို Group Admin ပေးထားဖို့လိုပါတယ်။\n"
@@ -432,8 +476,10 @@ async def ensure_game_chat(update, context):
     return True
 
 
-async def is_game_group_allowed(context, chat_id):
-    return await is_bot_admin(context, chat_id)
+async def is_game_group_allowed(context, chat_id, require_admin=True):
+    if require_admin:
+        return await is_bot_admin(context, chat_id)
+    return True
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -680,15 +726,11 @@ async def new_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game = WerewolfGame(chat_id, voting_seconds=voting_seconds)
     _ = sync_recommended_role_counts(game, force=True)
     games[chat_id] = game
-    await update.message.reply_text(
-        build_lobby_text(game),
-        reply_markup=build_lobby_keyboard(chat_id, game),
-        parse_mode="Markdown",
-    )
+    await update_lobby_message(context, chat_id, game, message=update.message)
 
 
 async def join_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_game_chat(update, context):
+    if not await ensure_game_chat(update, context, require_admin=False):
         return
 
     chat_id = update.effective_chat.id
@@ -708,13 +750,18 @@ async def join_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = update.effective_user
-    if game.add_player(user.id, user.first_name):
+    name = player_display_name(user)
+    if game.add_player(user.id, name):
         _ = sync_recommended_role_counts(game)
-        await update.message.reply_text(
-            f"✅ {user.first_name} ဂိမ်းထဲဝင်ပြီးပါပြီ။\n\n{build_lobby_text(game)}",
-            reply_markup=build_lobby_keyboard(chat_id, game),
-            parse_mode="Markdown",
-        )
+        try:
+            await update.message.reply_text(
+                f"✅ {escape_md(name)} ဂိမ်းထဲဝင်ပြီးပါပြီ။",
+                parse_mode="Markdown",
+            )
+            await update_lobby_message(context, chat_id, game, message=update.message)
+        except BadRequest:
+            await update.message.reply_text(f"✅ {name} ဂိမ်းထဲဝင်ပြီးပါပြီ။")
+            await update_lobby_message(context, chat_id, game, message=update.message)
     else:
         await update.message.reply_text("⚠️ သင် ဂိမ်းထဲဝင်ပြီးသားပါ။")
 
@@ -779,6 +826,7 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
     blocked_players = []
+    blocked_ids = []
     for pid, p in game.players.items():
         sent = await send_private_message(
             context,
@@ -787,16 +835,32 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if not sent:
             blocked_players.append(p["name"])
+            blocked_ids.append(pid)
 
-    if blocked_players:
+    if blocked_ids:
+        for pid in blocked_ids:
+            del game.players[pid]
+        for player in game.players.values():
+            player["role"] = None
+        game.status = "joining"
+        _ = sync_recommended_role_counts(game)
         names = ", ".join(blocked_players)
+        if len(game.players) < 4:
+            await update.message.reply_text(
+                "Not enough players can receive role DMs.\n"
+                f"{names}\n\n"
+                "Each player must `/start` the bot in private chat before joining.\n"
+                f"Only {len(game.players)} player(s) remain; need at least 4."
+            )
+            return
+
         await update.message.reply_text(
-            "⚠️ ဒီကစားသမားတွေကို Private Message ပို့လို့မရပါဘူး။\n"
+            "Some players could not receive role DMs and were removed.\n"
             f"{names}\n\n"
-            "Bot ကို private မှာ `/start` နှိပ်ပြီးမှ game ကိုပြန်စပါ။\n"
-            "ဒီ game ကို ရပ်လိုက်ပါပြီ။ `/newgame` နဲ့ ပြန်စပါ။"
+            "Each player must `/start` the bot in private chat before joining.\n"
+            f"{len(game.players)} player(s) remain. Run `/startgame` again."
         )
-        del games[chat_id]
+        await update_lobby_message(context, chat_id, game, message=update.message)
         return
 
     schedule_game_phase(chat_id, start_night(chat_id, context))
@@ -813,6 +877,7 @@ async def start_night(chat_id, context):
     await context.bot.send_message(
         chat_id=chat_id,
         text="🌑 **ညရောက်ပါပြီ... ရွာသားတွေ အိပ်ပျော်နေကြပါတယ်။**\nဝံပုလွေတွေနဲ့ Seer တို့ အလုပ်လုပ်နေကြပါတယ်။ (၂ မိနစ် စောင့်ပါ)",
+        parse_mode="Markdown",
     )
 
     alive = game.get_alive_players()
@@ -883,14 +948,17 @@ async def start_day(chat_id, context):
                 victims.append(player["name"])
 
     if victims:
-        victims_text = "\n".join([f"- {name}" for name in victims])
+        victims_text = "\n".join([f"- {escape_md(name)}" for name in victims])
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"☀️ **မနက်လင်းပါပြီ!**\n😱 မနေ့ညက အောက်ပါကစားသမားများ အသတ်ခံလိုက်ရပါတယ်။\n{victims_text}",
+            parse_mode="Markdown",
         )
     else:
         await context.bot.send_message(
-            chat_id=chat_id, text="☀️ **မနက်လင်းပါပြီ!**\n🙏 မနေ့ညက ဘယ်သူမှ အသတ်မခံရပါဘူး။"
+            chat_id=chat_id,
+            text="☀️ **မနက်လင်းပါပြီ!**\n🙏 မနေ့ညက ဘယ်သူမှ အသတ်မခံရပါဘူး။",
+            parse_mode="Markdown",
         )
 
     winner = game.check_winner()
@@ -931,7 +999,8 @@ async def process_voting(chat_id, context):
         role = game.players[lynched_id]["role"]
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"⚖️ မဲအများဆုံးရတဲ့ **{game.players[lynched_id]['name']}** ကို ဖမ်းဆီးလိုက်ပါပြီ။\nသူ့ရဲ့ Role က **{role.upper()}** ဖြစ်ပါတယ်။",
+            text=f"⚖️ မဲအများဆုံးရတဲ့ **{escape_md(game.players[lynched_id]['name'])}** ကို ဖမ်းဆီးလိုက်ပါပြီ။\nသူ့ရဲ့ Role က **{role.upper()}** ဖြစ်ပါတယ်။",
+            parse_mode="Markdown",
         )
     else:
         await context.bot.send_message(
@@ -965,12 +1034,14 @@ async def end_game(chat_id, context, winner):
 
     roles_summary = "\n".join(
         [
-            f"- {p['name']}: {(p['role'] or 'unknown').upper()}"
+            f"- {escape_md(p['name'])}: {(p['role'] or 'unknown').upper()}"
             for p in game.players.values()
         ]
     )
     await context.bot.send_message(
-        chat_id=chat_id, text=f"{msg}\n\n**Roles:**\n{roles_summary}"
+        chat_id=chat_id,
+        text=f"{msg}\n\n**Roles:**\n{roles_summary}",
+        parse_mode="Markdown",
     )
     del games[chat_id]
 
@@ -1129,8 +1200,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("join_"):
         cid = int(data.split("_")[1])
-        if not await is_game_group_allowed(context, cid):
-            await query.answer("⚠️ Bot ကို group admin ပေးထားဖို့လိုပါတယ်။")
+        if query.message and query.message.chat.id != cid:
+            await query.answer("Outdated lobby. Use /newgame.")
             return
         game = games.get(cid)
         if not game:
@@ -1139,14 +1210,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if game.status != "joining":
             await query.answer(f"⚠️ Join မရတော့ပါ။ ({describe_game_status(game.status)})")
             return
-        if game.add_player(user_id, query.from_user.first_name):
+        name = player_display_name(query.from_user)
+        if game.add_player(user_id, name):
             _ = sync_recommended_role_counts(game)
             await query.answer("✅ ဝင်လိုက်ပါပြီ")
-            await query.edit_message_text(
-                build_lobby_text(game),
-                reply_markup=build_lobby_keyboard(cid, game),
-                parse_mode="Markdown",
-            )
+            try:
+                await update_lobby_message(context, cid, game, query=query)
+            except Exception:
+                logger.exception("Could not update lobby message after join for chat %s", cid)
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text=build_lobby_text(game),
+                    reply_markup=build_lobby_keyboard(cid, game),
+                )
         else:
             await query.answer("⚠️ သင် ဂိမ်းထဲဝင်ပြီးသားပါ။")
 
@@ -1219,7 +1295,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             game.checked_users.add(user_id)
             await query.answer("🔮 စစ်ဆေးပြီးပါပြီ")
             await query.edit_message_text(
-                f"🔮 **{game.players[target_id]['name']}** ရဲ့ Role ကတော့ **{role.upper()}** ဖြစ်ပါတယ်။"
+                f"🔮 **{escape_md(game.players[target_id]['name'])}** ရဲ့ Role ကတော့ **{role.upper()}** ဖြစ်ပါတယ်။",
+                parse_mode="Markdown",
             )
         else:
             await query.answer(f"⚠️ အခုညအချိန်မဟုတ်ပါ။ ({describe_game_status(game.status)})")
@@ -1259,7 +1336,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             game.voted_users.add(user_id)
             await query.answer("⚖️ မဲပေးပြီးပါပြီ")
             await context.bot.send_message(
-                chat_id=cid, text=f"🗳 **{query.from_user.first_name}** က မဲပေးလိုက်ပါပြီ။"
+                chat_id=cid,
+                text=f"🗳 **{escape_md(query.from_user.first_name)}** က မဲပေးလိုက်ပါပြီ။",
+                parse_mode="Markdown",
             )
 
     elif data == "show_help":

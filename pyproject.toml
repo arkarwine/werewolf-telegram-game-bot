@@ -7,9 +7,7 @@ name = "gamebot"
 version = "0.1.0"
 description = "Telegram Werewolf game bot"
 requires-python = ">=3.9"
-dependencies = [
-    "python-telegram-bot>=20,<22",
-]
+dependencies = ["python-telegram-bot>=20,<22"]
 
 [tool.setuptools]
 py-modules = ["bot"]
